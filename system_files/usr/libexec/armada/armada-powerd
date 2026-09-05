@@ -65,6 +65,9 @@ XML = f"""
     <property name="FanPwm" type="u" access="read"/>
     <property name="FanRpm" type="u" access="read"/>
     <property name="Temperature" type="u" access="read"/>
+    <property name="MaxChargeLevel" type="i" access="readwrite"/>
+    <property name="SuggestedMinimumLimit" type="i" access="read"/>
+    <property name="ChargeLimitSupported" type="b" access="read"/>
   </interface>
 </node>
 """
@@ -272,6 +275,34 @@ class ArmadaPower:
         if actual_end != end:
             return False
         return start < CHARGE_START_MIN or actual_start == start
+
+    def charge_limit_value(self):
+        limits = self.read_charge_limit()
+        if limits is None:
+            return -1
+        end = limits[1]
+        # Valve's getter reports -1 for "no limit"; the firmware cannot be
+        # disabled from Linux, so treat 100 the same as unset.
+        if end <= 0 or end >= CHARGE_LIMIT_MAX:
+            return -1
+        return end
+
+    def set_charge_limit(self, level):
+        if level == -1:
+            level = CHARGE_LIMIT_MAX
+        if not CHARGE_LIMIT_MIN <= level <= CHARGE_LIMIT_MAX:
+            raise ValueError(f"charge limit {level} outside {CHARGE_LIMIT_MIN}..{CHARGE_LIMIT_MAX}")
+        if self.battery_dir() is None:
+            raise RuntimeError("no battery exposes charge control thresholds")
+        start = max(CHARGE_START_MIN, level - CHARGE_LIMIT_GAP)
+        if not self.write_charge_limit(start, level):
+            print(f"armada-powerd: charge limit {start}/{level} did not read back; retrying", file=sys.stderr)
+            self.schedule_charge_limit((start, level))
+        return self.charge_limit_value()
+
+    def schedule_charge_limit(self, target=None):
+        # target None means rewrite whatever sysfs currently reads.
+        self.charge_limit_pending = {"attempts": CHARGE_REAPPLY_ATTEMPTS, "wait": 1, "target": target}
 
     def cpu_device_class(self):
         return self.env.get("ARMADA_SOC_CLASS", "")
@@ -898,6 +929,12 @@ class ArmadaPower:
             return GLib.Variant("u", self.fan_rpm_value())
         if prop == "Temperature":
             return GLib.Variant("u", self.read_temp())
+        if prop == "MaxChargeLevel":
+            return GLib.Variant("i", self.charge_limit_value())
+        if prop == "SuggestedMinimumLimit":
+            return GLib.Variant("i", CHARGE_LIMIT_MIN)
+        if prop == "ChargeLimitSupported":
+            return GLib.Variant("b", self.battery_dir() is not None)
         raise KeyError(prop)
 
     def set_property(self, prop, value):
@@ -928,6 +965,8 @@ class ArmadaPower:
             if self.gpu_level == "manual":
                 mhz = self.set_gpu_manual_clock(mhz)
             changed["ManualGpuClock"] = GLib.Variant("u", mhz)
+        elif prop == "MaxChargeLevel":
+            changed["MaxChargeLevel"] = GLib.Variant("i", self.set_charge_limit(value.get_int32()))
         else:
             raise KeyError(prop)
         self.save_state()

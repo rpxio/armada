@@ -73,6 +73,7 @@ def new_power(root):
     power.battery = None
     power.charge_limit_pending = None
     power.connection = None
+    power.gpu = None
     power.save_state = lambda: None
     power.emitted = []
     power.emit_properties = lambda changed: power.emitted.append(changed)
@@ -109,6 +110,66 @@ real_write_text = powerd.write_text
 powerd.write_text = lambda path, value: True
 check("write_charge_limit False on readback mismatch", power.write_charge_limit(80, 85) is False)
 powerd.write_text = real_write_text
+
+# --- armada-powerd: MaxChargeLevel semantics --------------------------------
+power = new_power(ps)
+(battery / "charge_control_start_threshold").write_text("70\n")
+(battery / "charge_control_end_threshold").write_text("80\n")
+check("value: android 80 -> 80", power.charge_limit_value() == 80)
+(battery / "charge_control_end_threshold").write_text("100\n")
+check("value: 100 -> -1", power.charge_limit_value() == -1)
+(battery / "charge_control_end_threshold").write_text("0\n")
+check("value: 0 -> -1", power.charge_limit_value() == -1)
+check("value: no battery -> -1", new_power(ps_none + "-missing").charge_limit_value() == -1)
+
+check("set 80 returns 80", power.set_charge_limit(80) == 80)
+check("set 80 writes 75/80", read_thresholds(battery) == (75, 80))
+check("set 55 writes 50/55", power.set_charge_limit(55) == 55 and read_thresholds(battery) == (50, 55))
+check("set -1 returns -1", power.set_charge_limit(-1) == -1)
+check("set -1 writes 95/100", read_thresholds(battery) == (95, 100))
+check("set 97 then -1 resets", power.set_charge_limit(97) == 97 and power.set_charge_limit(-1) == -1
+      and read_thresholds(battery) == (95, 100))
+for bad in (54, 101, 0, -2):
+    try:
+        power.set_charge_limit(bad)
+        check(f"set rejects {bad}", False)
+    except ValueError:
+        pass
+check("bad set leaves thresholds", read_thresholds(battery) == (95, 100))
+try:
+    new_power(ps_none + "-missing").set_charge_limit(80)
+    check("set without battery raises", False)
+except RuntimeError:
+    pass
+
+check("no pending after good set", power.charge_limit_pending is None)
+powerd.write_text = lambda path, value: True
+power.set_charge_limit(85)
+powerd.write_text = real_write_text
+check("failed set schedules retry with target",
+      power.charge_limit_pending == {"attempts": 5, "wait": 1, "target": (80, 85)})
+
+# --- armada-powerd: D-Bus properties ----------------------------------------
+power = new_power(ps)
+check("XML declares MaxChargeLevel i readwrite",
+      '<property name="MaxChargeLevel" type="i" access="readwrite"/>' in powerd.XML)
+check("XML declares SuggestedMinimumLimit i read",
+      '<property name="SuggestedMinimumLimit" type="i" access="read"/>' in powerd.XML)
+check("XML declares ChargeLimitSupported b read",
+      '<property name="ChargeLimitSupported" type="b" access="read"/>' in powerd.XML)
+check("get MaxChargeLevel", power.get_property("MaxChargeLevel") == ("i", -1))
+check("get SuggestedMinimumLimit", power.get_property("SuggestedMinimumLimit") == ("i", 55))
+check("get ChargeLimitSupported", power.get_property("ChargeLimitSupported") == ("b", True))
+check("get ChargeLimitSupported false",
+      new_power(ps_none + "-missing").get_property("ChargeLimitSupported") == ("b", False))
+power.set_property("MaxChargeLevel", types.SimpleNamespace(get_int32=lambda: 80))
+check("set property writes 75/80", read_thresholds(battery) == (75, 80))
+check("set property emits readback", power.emitted == [{"MaxChargeLevel": ("i", 80)}])
+try:
+    power.set_property("MaxChargeLevel", types.SimpleNamespace(get_int32=lambda: 40))
+    check("set property rejects 40", False)
+except ValueError:
+    pass
 
 if failures:
     print(f"{len(failures)} check(s) failed", file=sys.stderr)

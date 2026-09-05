@@ -239,6 +239,90 @@ power.fan_tick = lambda: None
 power.resume()
 check("resume schedules re-apply", power.charge_limit_pending == {"attempts": 5, "wait": 1, "target": None})
 
+# --- steamos-manager shim: BatteryChargeLimit1 gating -----------------------
+import xml.etree.ElementTree as ET
+
+
+class FakeVariant:
+    def __init__(self, sig, value):
+        self.sig, self.value = sig, value
+
+    def get_boolean(self):
+        return bool(self.value)
+
+    def get_int32(self):
+        return int(self.value)
+
+
+gi = types.ModuleType("gi")
+gi.require_version = lambda *args: None
+repository = types.ModuleType("gi.repository")
+repository.GLib = types.SimpleNamespace(Variant=FakeVariant)
+repository.Gio = types.SimpleNamespace()
+gi.repository = repository
+sys.modules["gi"] = gi
+sys.modules["gi.repository"] = repository
+shim = load_script("steamos-manager")
+
+IFACE_BATTERY = "com.steampowered.SteamOSManager1.BatteryChargeLimit1"
+check("IFACE_BATTERY matches Valve", shim.IFACE_BATTERY == IFACE_BATTERY)
+with_battery = shim.node_xml(True)
+without = shim.node_xml(False)
+ET.fromstring(with_battery)
+ET.fromstring(without)
+check("interface present when supported", IFACE_BATTERY in with_battery)
+check("interface absent when unsupported", IFACE_BATTERY not in without)
+check("other interfaces kept", shim.IFACE_PROFILE in without and shim.IFACE_SESSION in without)
+check("MaxChargeLevel i readwrite",
+      '<property name="MaxChargeLevel" type="i" access="readwrite"/>' in with_battery)
+check("SuggestedMinimumLimit i read",
+      '<property name="SuggestedMinimumLimit" type="i" access="read"/>' in with_battery)
+
+
+class FakePower:
+    def __init__(self, supported, level=-1):
+        self.supported = supported
+        self.level = level
+        self.sets = []
+
+    def get(self, name):
+        if name == "ChargeLimitSupported":
+            if self.supported is None:
+                raise RuntimeError("powerd down")
+            return FakeVariant("b", self.supported)
+        if name == "MaxChargeLevel":
+            return FakeVariant("i", self.level)
+        if name == "SuggestedMinimumLimit":
+            return FakeVariant("i", 55)
+        raise KeyError(name)
+
+    def set(self, name, value):
+        self.sets.append((name, value.get_int32()))
+        self.level = value.get_int32()
+
+
+def new_manager(power):
+    manager = shim.ArmadaSteamOSManager.__new__(shim.ArmadaSteamOSManager)
+    manager.power = power
+    manager.emitted = []
+    manager.emit_properties = lambda iface, changed: manager.emitted.append((iface, changed))
+    return manager
+
+
+check("supported true", new_manager(FakePower(True)).charge_limit_supported() is True)
+check("supported false", new_manager(FakePower(False)).charge_limit_supported() is False)
+check("powerd unreachable -> unsupported", new_manager(FakePower(None)).charge_limit_supported() is False)
+
+manager = new_manager(FakePower(True, level=80))
+check("get MaxChargeLevel passthrough",
+      manager.get_property(IFACE_BATTERY, "MaxChargeLevel").value == 80)
+check("get SuggestedMinimumLimit passthrough",
+      manager.get_property(IFACE_BATTERY, "SuggestedMinimumLimit").value == 55)
+manager.set_property(IFACE_BATTERY, "MaxChargeLevel", FakeVariant("i", 90))
+check("set forwards to powerd", manager.power.sets == [("MaxChargeLevel", 90)])
+check("set emits readback", len(manager.emitted) == 1 and manager.emitted[0][0] == IFACE_BATTERY
+      and manager.emitted[0][1]["MaxChargeLevel"].value == 90)
+
 if failures:
     print(f"{len(failures)} check(s) failed", file=sys.stderr)
     sys.exit(1)

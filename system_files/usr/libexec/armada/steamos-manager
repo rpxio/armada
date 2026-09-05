@@ -20,6 +20,7 @@ IFACE_MANAGER = "com.steampowered.SteamOSManager1.Manager2"
 IFACE_PROFILE = "com.steampowered.SteamOSManager1.PerformanceProfile1"
 IFACE_GPU = "com.steampowered.SteamOSManager1.GpuPerformanceLevel1"
 IFACE_SESSION = "com.steampowered.SteamOSManager1.SessionManagement1"
+IFACE_BATTERY = "com.steampowered.SteamOSManager1.BatteryChargeLimit1"
 IFACE_OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 
 POWER_BUS = "org.armada.Power"
@@ -47,7 +48,7 @@ ROOT_XML = f"""
 </node>
 """
 
-NODE_XML = f"""
+NODE_XML_BASE = f"""
 <node>
   <interface name="{IFACE_MANAGER}">
     <method name="ReloadConfig"/>
@@ -81,8 +82,20 @@ NODE_XML = f"""
     <property name="ManualGpuClockMin" type="u" access="read"/>
     <property name="ManualGpuClockMax" type="u" access="read"/>
   </interface>
-</node>
 """
+
+BATTERY_XML = f"""
+  <interface name="{IFACE_BATTERY}">
+    <property name="MaxChargeLevel" type="i" access="readwrite"/>
+    <property name="SuggestedMinimumLimit" type="i" access="read"/>
+  </interface>
+"""
+
+
+def node_xml(charge_limit):
+    # BatteryChargeLimit1 is optional in Valve's spec; its presence is the
+    # feature flag Steam uses to show the charge limit setting.
+    return NODE_XML_BASE + (BATTERY_XML if charge_limit else "") + "</node>\n"
 
 
 def shell_env():
@@ -176,6 +189,13 @@ class ArmadaSteamOSManager:
             GLib.Variant("(sa{sv}as)", (iface, changed, [])),
         )
 
+    def charge_limit_supported(self):
+        try:
+            return bool(self.power.get("ChargeLimitSupported").get_boolean())
+        except Exception as exc:
+            print(f"armada-steamos-manager: charge limit unavailable: {exc}", file=sys.stderr)
+            return False
+
     def get_property(self, iface, prop):
         if iface == IFACE_MANAGER and prop == "DeviceModel":
             return GLib.Variant("(ss)", (self.device_id, self.device_name))
@@ -200,6 +220,8 @@ class ArmadaSteamOSManager:
                 "ManualGpuClockMax": "ManualGpuClockMax",
             }
             return self.power.get(mapping[prop])
+        if iface == IFACE_BATTERY and prop in ("MaxChargeLevel", "SuggestedMinimumLimit"):
+            return self.power.get(prop)
         return None
 
     def set_property(self, iface, prop, value):
@@ -227,6 +249,15 @@ class ArmadaSteamOSManager:
                 applied = self.power.get("ManualGpuClock")
             except Exception as exc:
                 print(f"armada-steamos-manager: readback ManualGpuClock failed: {exc}", file=sys.stderr)
+                return
+            self.emit_properties(iface, {prop: applied})
+            return
+        if iface == IFACE_BATTERY and prop == "MaxChargeLevel":
+            self.power.set("MaxChargeLevel", value)
+            try:
+                applied = self.power.get("MaxChargeLevel")
+            except Exception as exc:
+                print(f"armada-steamos-manager: readback MaxChargeLevel failed: {exc}", file=sys.stderr)
                 return
             self.emit_properties(iface, {prop: applied})
             return
@@ -340,7 +371,7 @@ class ArmadaSteamOSManager:
     def register(self, connection):
         self.connection = connection
         self.root_node = Gio.DBusNodeInfo.new_for_xml(ROOT_XML)
-        self.node = Gio.DBusNodeInfo.new_for_xml(NODE_XML)
+        self.node = Gio.DBusNodeInfo.new_for_xml(node_xml(self.charge_limit_supported()))
         connection.register_object(
             "/",
             self.root_node.interfaces[0],

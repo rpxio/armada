@@ -171,6 +171,74 @@ try:
 except ValueError:
     pass
 
+# --- armada-powerd: tick-driven re-apply ------------------------------------
+writes = []
+powerd.write_text = lambda path, value: writes.append((path.name, int(value))) or real_write_text(path, value)
+
+power = new_power(ps)
+(battery / "charge_control_start_threshold").write_text("70\n")
+(battery / "charge_control_end_threshold").write_text("80\n")
+power.schedule_charge_limit()
+power.charge_limit_tick()
+check("first tick waits", writes == [] and power.charge_limit_pending["wait"] == 0)
+power.charge_limit_tick()
+check("rewrite preserves android 70/80",
+      writes == [("charge_control_start_threshold", 70), ("charge_control_end_threshold", 80)])
+check("rewrite clears pending", power.charge_limit_pending is None)
+power.charge_limit_tick()
+check("idle tick writes nothing", len(writes) == 2)
+
+writes.clear()
+(battery / "charge_control_start_threshold").write_text("0\n")
+(battery / "charge_control_end_threshold").write_text("0\n")
+power.schedule_charge_limit()
+power.charge_limit_tick()
+power.charge_limit_tick()
+check("unset limit is not rewritten", writes == [] and power.charge_limit_pending is None)
+
+writes.clear()
+(battery / "charge_control_start_threshold").write_text("0\n")
+(battery / "charge_control_end_threshold").write_text("80\n")
+power.schedule_charge_limit()
+power.charge_limit_tick()
+power.charge_limit_tick()
+check("partial limit rewrites end only", writes == [("charge_control_end_threshold", 80)])
+
+writes.clear()
+late_root = os.path.join(WORK, "ps-late")
+os.makedirs(late_root)
+power = new_power(late_root)
+power.schedule_charge_limit()
+for _ in range(10):
+    power.charge_limit_tick()
+check("waits for battery without consuming attempts",
+      writes == [] and power.charge_limit_pending["attempts"] == 5)
+late_bat = make_supply(late_root, "battery", "Battery", (75, 80))
+power.charge_limit_tick()   # battery now visible; this tick consumes the wait
+power.charge_limit_tick()
+check("applies once battery appears",
+      writes == [("charge_control_start_threshold", 75), ("charge_control_end_threshold", 80)]
+      and power.charge_limit_pending is None)
+
+writes.clear()
+powerd.write_text = lambda path, value: True
+power.schedule_charge_limit((80, 85))
+for _ in range(7):
+    power.charge_limit_tick()
+check("gives up after 5 attempts", power.charge_limit_pending is None)
+powerd.write_text = real_write_text
+check("give-up leaves thresholds untouched", read_thresholds(late_bat) == (75, 80))
+
+power = new_power(ps)
+power.suspended = True
+power.suspend_save = {}
+power.smoothed_temp = 0.0
+power.apply_profile = lambda: None
+power.gpu_level = "auto"
+power.fan_tick = lambda: None
+power.resume()
+check("resume schedules re-apply", power.charge_limit_pending == {"attempts": 5, "wait": 1, "target": None})
+
 if failures:
     print(f"{len(failures)} check(s) failed", file=sys.stderr)
     sys.exit(1)

@@ -231,6 +231,7 @@ class ArmadaPower:
         self.discover()
         self.apply_underclock_refs()
         self.load_state()
+        self.schedule_charge_limit()
         if self.fan_pwm:
             current = read_text(self.fan_pwm)
             self.last_pwm = int(current) if current.isdigit() else self.fan_config["min_pwm"]
@@ -303,6 +304,33 @@ class ArmadaPower:
     def schedule_charge_limit(self, target=None):
         # target None means rewrite whatever sysfs currently reads.
         self.charge_limit_pending = {"attempts": CHARGE_REAPPLY_ATTEMPTS, "wait": 1, "target": target}
+
+    def charge_limit_tick(self):
+        pending = self.charge_limit_pending
+        if not pending or self.battery_dir() is None:
+            return
+        if pending["wait"] > 0:
+            # Give the GLINK channel a tick to come back after resume.
+            pending["wait"] -= 1
+            return
+        target = pending["target"] or self.read_charge_limit()
+        start, end = target
+        if end < CHARGE_LIMIT_MIN:
+            # Unset (Android disabled it or nvmem is empty); nothing to enforce.
+            self.charge_limit_pending = None
+            return
+        if self.write_charge_limit(start, end):
+            self.charge_limit_pending = None
+            print(f"armada-powerd: charge limit applied {start}/{end}", file=sys.stderr)
+            return
+        pending["attempts"] -= 1
+        if pending["attempts"] <= 0:
+            self.charge_limit_pending = None
+            print(
+                f"armada-powerd: charge limit {start}/{end} did not read back after "
+                f"{CHARGE_REAPPLY_ATTEMPTS} attempts",
+                file=sys.stderr,
+            )
 
     def cpu_device_class(self):
         return self.env.get("ARMADA_SOC_CLASS", "")
@@ -725,6 +753,7 @@ class ArmadaPower:
     def resume(self):
         self.suspended = False
         self.smoothed_temp = 0.0
+        self.schedule_charge_limit()
         if not self.suspend_save:
             self.apply_profile()
             if self.gpu_level == "manual" and self.manual_gpu_clock:
@@ -838,6 +867,10 @@ class ArmadaPower:
 
     def fan_tick(self):
         self.perf_tick()
+        try:
+            self.charge_limit_tick()
+        except Exception as exc:
+            print(f"armada-powerd: charge limit tick failed: {exc}", file=sys.stderr)
         try:
             if not self.fan_pwm:
                 sd_notify("WATCHDOG=1")
@@ -1075,6 +1108,7 @@ class ArmadaPower:
         self, _connection, _sender, _path, _iface, _signal, params
     ):
         if not params.unpack()[0]:
+            self.schedule_charge_limit()
             self.apply_profile()
             if self.gpu_level == "manual" and self.manual_gpu_clock:
                 self.set_gpu_manual_clock(self.manual_gpu_clock)

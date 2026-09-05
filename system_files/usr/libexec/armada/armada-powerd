@@ -27,6 +27,16 @@ STATE_FILE = Path("/var/lib/armada/powerd.state")
 FACTORY_CONFIG_FILE = Path("/usr/share/armada/power-profiles.conf")
 CONFIG_FILE = Path("/etc/armada/power-profiles.conf")
 FAN_SAFE_PWM = 128
+POWER_SUPPLY_ROOT = Path("/sys/class/power_supply")
+CHARGE_START_FILE = "charge_control_start_threshold"
+CHARGE_END_FILE = "charge_control_end_threshold"
+# qcom_battmgr.c bounds (CHARGE_CTRL_*_THR_MIN/MAX, DELTA_SOC). Compile-time
+# constants; the driver clamps silently, so validate here.
+CHARGE_LIMIT_MIN = 55
+CHARGE_LIMIT_MAX = 100
+CHARGE_START_MIN = 50
+CHARGE_LIMIT_GAP = 5
+CHARGE_REAPPLY_ATTEMPTS = 5
 
 
 def normalize_profile(profile):
@@ -74,6 +84,21 @@ def write_text(path, value):
     except OSError as exc:
         print(f"armada-powerd: write failed {path}: {exc}", file=sys.stderr)
         return False
+
+
+def read_int(path):
+    value = read_text(path)
+    return int(value) if value.lstrip("-").isdigit() else 0
+
+
+def discover_battery(root=None):
+    root = Path(root) if root else POWER_SUPPLY_ROOT
+    for supply in sorted(root.glob("*")):
+        if read_text(supply / "type") != "Battery":
+            continue
+        if (supply / CHARGE_END_FILE).exists():
+            return supply
+    return None
 
 
 def restore_factory_config(reason):
@@ -196,6 +221,8 @@ class ArmadaPower:
         self.scx_spec = None
         self.scx_failed = None
         self.scx_warned = set()
+        self.battery = None
+        self.charge_limit_pending = None
         self.load_config()
         self.profile = self.default_profile
         self.discover()
@@ -219,6 +246,32 @@ class ArmadaPower:
         self.fan_enable = self.fan_hwmon / "pwm1_enable" if self.fan_hwmon else None
         self.fan_rpm = self.fan_hwmon / "fan1_input" if self.fan_hwmon else None
         self.temp_paths = self.discover_temps()
+        self.battery = discover_battery()
+
+    def battery_dir(self):
+        # The battery manager probes after the ADSP loads, so keep looking.
+        if self.battery is None:
+            self.battery = discover_battery()
+        return self.battery
+
+    def read_charge_limit(self):
+        battery = self.battery_dir()
+        if battery is None:
+            return None
+        return (read_int(battery / CHARGE_START_FILE), read_int(battery / CHARGE_END_FILE))
+
+    def write_charge_limit(self, start, end):
+        battery = self.battery_dir()
+        if battery is None:
+            return False
+        # The driver derives delta from the cached start, so write start first.
+        if start >= CHARGE_START_MIN:
+            write_text(battery / CHARGE_START_FILE, start)
+        write_text(battery / CHARGE_END_FILE, end)
+        actual_start, actual_end = self.read_charge_limit()
+        if actual_end != end:
+            return False
+        return start < CHARGE_START_MIN or actual_start == start
 
     def cpu_device_class(self):
         return self.env.get("ARMADA_SOC_CLASS", "")
